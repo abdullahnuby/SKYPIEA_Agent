@@ -1,4 +1,4 @@
-# Device Agent 🤖
+# SKYPIEA Agent 🤖
 
 Agent محلي بيشتغل على جهازك، مربوط بأي LLM، وبتكلمه من تيليجرام.
 
@@ -102,6 +102,13 @@ Agent محلي بيشتغل على جهازك، مربوط بأي LLM، وبتك
 
 ## التشغيل في 5 دقايق
 
+### 0) نزّل المشروع
+
+```powershell
+git clone https://github.com/abdullahnuby/SKYPIEA_Agent.git
+cd SKYPIEA_Agent
+```
+
 ### 1) اعمل بوت
 
 1. افتح [@BotFather](https://t.me/BotFather) → `/newbot` → خد التوكن.
@@ -110,7 +117,6 @@ Agent محلي بيشتغل على جهازك، مربوط بأي LLM، وبتك
 ### 2) الإعدادات
 
 ```powershell
-cd "C:\path\to\device-agent"
 Copy-Item .env.example .env
 notepad .env
 ```
