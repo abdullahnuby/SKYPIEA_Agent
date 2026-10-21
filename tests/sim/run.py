@@ -22,17 +22,6 @@ sys.path.insert(0, str(BASE))
 
 from tests.sim.gen import build  # noqa: E402
 
-_AGENT = None  # type: ignore[var-annotated]
-
-
-def _worker_init() -> None:
-    global _AGENT
-    if _AGENT is None:
-        from tests.sim.simcore import SimAgent
-
-        _AGENT = SimAgent(0)
-
-
 def _contains(text: str, needle: str) -> bool:
     from agent.text import normalize
 
@@ -119,9 +108,10 @@ def _evaluate(cat: str, rec: dict[str, Any], exp: dict[str, Any], facts: list[di
 
 
 def _run_chunk(items: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
-    global _AGENT
-    _worker_init()
-    assert _AGENT is not None
+    from tests.sim.simcore import SimAgent
+
+    # وكيل جديد لكل دفعة: يمنع تراكم ذاكرة مليون محادثة في الرام.
+    agent = SimAgent(0)
 
     out: dict[str, Any] = {
         "turns": 0,
@@ -132,21 +122,21 @@ def _run_chunk(items: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
         "failures": [],
     }
 
-    for idx, sc in items:
-        chat = idx + 1
-        _AGENT.chat_id = chat
+    for local_idx, (_, sc) in enumerate(items, 1):
+        chat = local_idx
+        agent.chat_id = chat
         for key, value in sc.get("seed", []):
-            _AGENT.memory.save_fact(chat, key, value, "seed")
+            agent.memory.save_fact(chat, key, value, "seed")
         for msg in sc.get("seed_messages", []):
-            _AGENT.memory.add_message(chat, {"role": "user", "content": msg})
+            agent.memory.add_message(chat, {"role": "user", "content": msg})
 
         cat_stats = out["categories"][sc["cat"]]
         cat_stats["scenarios"] += 1
         scenario_failed = False
 
         for t_index, item in enumerate(sc["turns"]):
-            rec = _AGENT.step(item["text"])
-            facts = _AGENT.facts()
+            rec = agent.step(item["text"])
+            facts = agent.facts()
             out["turns"] += 1
             cat_stats["turns"] += 1
             fails = _evaluate(sc["cat"], rec, item["exp"], facts, chat)
@@ -189,25 +179,15 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4))
     parser.add_argument("--chunk", type=int, default=400)
+    parser.add_argument("--gen-chunk", type=int, default=10000)
     parser.add_argument("--report", type=str, default="data/sim_report")
     parser.add_argument("--keep-failures", type=int, default=600)
     args = parser.parse_args()
 
-    print(f"توليد {args.n} سيناريو (seed={args.seed}) ...")
-    scenarios = build(args.n, args.seed)
-    print(f"تم توليد {len(scenarios)} — التوزيع: {dict(Counter(s['cat'] for s in scenarios))}")
+    gen_chunk = args.gen_chunk if args.gen_chunk > 0 else args.n
+    total_chunks = (args.n + args.chunk - 1) // args.chunk
 
-    indexed = list(enumerate(scenarios))
-    chunks = [indexed[i : i + args.chunk] for i in range(0, len(indexed), args.chunk)]
-
-    started = time.time()
-    results = []
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init) as pool:
-        for done, result in enumerate(pool.map(_run_chunk, chunks), 1):
-            results.append(result)
-            if done % 20 == 0 or done == len(chunks):
-                elapsed = time.time() - started
-                print(f"  {done}/{len(chunks)} دفعة — {elapsed:.0f}s")
+    print(f"توليد {args.n} سيناريو (seed={args.seed}) على دفعات {gen_chunk} ...")
 
     merged: dict[str, Any] = {
         "turns": 0,
@@ -217,22 +197,49 @@ def main() -> int:
         "kinds": Counter(),
         "failures": [],
     }
-    categories: dict[str, dict[str, int]] = defaultdict(lambda: {"scenarios": 0, "failed": 0, "turns": 0})
-    for result in results:
-        merged["turns"] += result["turns"]
-        merged["failed_turns"] += result["failed_turns"]
-        merged["failed_scenarios"] += result["failed_scenarios"]
-        merged["kinds"].update(result["kinds"])
-        for cat, stats in result["categories"].items():
-            for key, value in stats.items():
-                categories[cat][key] += value
-        merged["failures"].extend(result["failures"])
+    categories: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"scenarios": 0, "failed": 0, "turns": 0}
+    )
+    distribution: Counter = Counter()
+    started = time.time()
+    processed = 0
 
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        for batch_start in range(0, args.n, gen_chunk):
+            count = min(gen_chunk, args.n - batch_start)
+            scenarios = build(count, args.seed + batch_start)
+            for offset, scenario in enumerate(scenarios, start=batch_start):
+                scenario["id"] = f"{scenario['cat']}-{offset:06d}"
+                distribution[scenario["cat"]] += 1
+
+            indexed = list(enumerate(scenarios, start=batch_start))
+            subchunks = [
+                indexed[i : i + args.chunk]
+                for i in range(0, len(indexed), args.chunk)
+            ]
+            for result in pool.map(_run_chunk, subchunks):
+                merged["turns"] += result["turns"]
+                merged["failed_turns"] += result["failed_turns"]
+                merged["failed_scenarios"] += result["failed_scenarios"]
+                merged["kinds"].update(result["kinds"])
+                for cat, stats in result["categories"].items():
+                    for key, value in stats.items():
+                        categories[cat][key] += value
+                if len(merged["failures"]) < 4000:
+                    merged["failures"].extend(result["failures"])
+                processed += 1
+                if processed % 20 == 0 or processed == total_chunks:
+                    elapsed = time.time() - started
+                    print(f"  {processed}/{total_chunks} دفعة — {elapsed:.0f}s")
+            del scenarios, indexed, subchunks
+
+    print(f"تم توليد {sum(distribution.values())} — التوزيع: {dict(distribution)}")
     merged["categories"] = dict(categories)
     merged["kinds"] = dict(merged["kinds"])
     merged["elapsed_sec"] = round(time.time() - started, 1)
     merged["n"] = args.n
     merged["seed"] = args.seed
+    merged["gen_chunk"] = gen_chunk
 
     failures = merged["failures"]
     failures.sort(key=lambda f: (f["cat"], f["kind"]))
